@@ -23,7 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 APP_NAME = "Athey Creek Book Importer"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 BASE_URL = "https://atheycreek.com"
 BOOKS_URL = f"{BASE_URL}/teachings/books"
 USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {APP_NAME}/{APP_VERSION}"
@@ -485,8 +485,8 @@ class ImporterApp:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.geometry("800x590")
-        self.root.minsize(700, 500)
+        self.root.geometry("1080x720")
+        self.root.minsize(940, 620)
 
         self.book = StringVar(value="Genesis")
         default_workbook = find_default_workbook()
@@ -495,6 +495,7 @@ class ImporterApp:
         self.preserve = BooleanVar(value=True)
         self.status = StringVar(value="Choose a Bible book and workbook.")
         self.messages: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.preview_lessons: list[dict[str, str]] = []
 
         self._build()
         self.root.after(100, self._poll_messages)
@@ -506,7 +507,7 @@ class ImporterApp:
         ttk.Label(frame, text=f"Athey Creek Book Importer v{APP_VERSION}", font=("Segoe UI", 18, "bold")).pack(anchor=W)
         ttk.Label(
             frame,
-            text="Imports exact Scripture, title and date, creates a backup, and writes an import report.",
+            text="Preview, verify, and import exact Scripture, title, date, code, and lesson links.",
         ).pack(anchor=W, pady=(2, 18))
 
         fields = ttk.Frame(frame)
@@ -538,18 +539,40 @@ class ImporterApp:
             variable=self.include_all,
         ).pack(anchor=W, pady=(5, 0))
 
-        self.import_button = ttk.Button(frame, text="Import Selected Book", command=self._start)
-        self.import_button.pack(anchor=W, pady=(0, 12))
+        actions = ttk.Frame(frame)
+        actions.pack(fill=X, pady=(0, 12))
+        self.preview_button = ttk.Button(actions, text="1. Preview Selected Book", command=self._start_preview)
+        self.preview_button.pack(side=LEFT)
+        self.import_button = ttk.Button(actions, text="2. Import Previewed Book", command=self._start_import, state="disabled")
+        self.import_button.pack(side=LEFT, padx=8)
+        self.verify_button = ttk.Button(actions, text="Verify Workbook Book", command=self._start_verify)
+        self.verify_button.pack(side=LEFT)
 
         self.progress_bar = ttk.Progressbar(frame, mode="determinate")
         self.progress_bar.pack(fill=X)
 
         ttk.Label(frame, textvariable=self.status).pack(anchor=W, pady=(7, 8))
 
+        preview_frame = ttk.LabelFrame(frame, text="Lesson Preview", padding=8)
+        preview_frame.pack(fill=BOTH, expand=True)
+        columns = ("lesson", "code", "scripture", "title", "date")
+        self.preview_tree = ttk.Treeview(preview_frame, columns=columns, show="headings", height=12)
+        for col, heading, width in [("lesson","Lesson",65),("code","Code",90),("scripture","Scripture",220),("title","Title",430),("date","Date",150)]:
+            self.preview_tree.heading(col, text=heading)
+            self.preview_tree.column(col, width=width, anchor=W)
+        ybar = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_tree.yview)
+        xbar = ttk.Scrollbar(preview_frame, orient="horizontal", command=self.preview_tree.xview)
+        self.preview_tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        self.preview_tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.columnconfigure(0, weight=1)
+
         log_frame = ttk.LabelFrame(frame, text="Activity", padding=8)
-        log_frame.pack(fill=BOTH, expand=True)
-        self.log = __import__("tkinter").Text(log_frame, height=12, wrap="word", state="disabled")
-        self.log.pack(fill=BOTH, expand=True)
+        log_frame.pack(fill=X, pady=(8,0))
+        self.log = __import__("tkinter").Text(log_frame, height=7, wrap="word", state="disabled")
+        self.log.pack(fill=X)
 
         ttk.Label(
             frame,
@@ -570,26 +593,107 @@ class ImporterApp:
         self.log.see(END)
         self.log.configure(state="disabled")
 
-    def _start(self) -> None:
-        path = Path(self.workbook.get().strip())
-        if not self.workbook.get().strip():
-            messagebox.showwarning(APP_NAME, "Select your Excel workbook first.")
-            return
-        if not path.exists():
-            messagebox.showerror(APP_NAME, "The selected workbook does not exist.")
-            return
+    def _set_busy(self, busy: bool) -> None:
+        state = "disabled" if busy else "normal"
+        self.preview_button.configure(state=state)
+        self.verify_button.configure(state=state)
+        self.import_button.configure(state="disabled" if busy or not self.preview_lessons else "normal")
 
-        self.import_button.configure(state="disabled")
+    def _start_preview(self) -> None:
+        self.preview_lessons = []
+        for item in self.preview_tree.get_children():
+            self.preview_tree.delete(item)
+        self._set_busy(True)
         self.progress_bar["value"] = 0
-        self._append_log(f"Starting {self.book.get()} import…")
-        self.status.set("Connecting to Athey Creek…")
+        self.status.set("Reading official lesson pages…")
+        threading.Thread(target=self._preview_worker, daemon=True).start()
 
-        worker = threading.Thread(
-            target=self._run_worker,
-            args=(self.book.get(), path, self.include_all.get(), self.preserve.get()),
-            daemon=True,
-        )
-        worker.start()
+    def _preview_worker(self) -> None:
+        try:
+            session = make_session()
+            urls = lesson_urls(session, self.book.get())
+            lessons, warnings, seen = [], [], set()
+            for index, url in enumerate(urls, 1):
+                self.messages.put(("progress", (f"Reading lesson {index} of {len(urls)}", index, len(urls))))
+                try:
+                    lesson = parse_lesson(session, url)
+                except Exception as exc:
+                    warnings.append(f"{url}: {exc}")
+                    continue
+                if lesson["code"] in seen:
+                    warnings.append(f"Duplicate teaching code skipped: {lesson['code']}")
+                    continue
+                seen.add(lesson["code"])
+                if self.include_all.get() or lesson["title"].lower().startswith("through the bible"):
+                    lessons.append(lesson)
+            if not lessons:
+                raise ImporterError(f"No matching lessons were found for {self.book.get()}.")
+            self.messages.put(("preview_done", (lessons, warnings)))
+        except Exception as exc:
+            self.messages.put(("error", str(exc)))
+
+    def _start_import(self) -> None:
+        path = Path(self.workbook.get().strip())
+        if not path.exists():
+            messagebox.showerror(APP_NAME, "Select a valid workbook first.")
+            return
+        if not self.preview_lessons:
+            messagebox.showwarning(APP_NAME, "Preview the selected book before importing.")
+            return
+        self._set_busy(True)
+        threading.Thread(target=self._import_previewed_worker, args=(path,), daemon=True).start()
+
+    def _import_previewed_worker(self, path: Path) -> None:
+        try:
+            self.messages.put(("progress", ("Writing previewed lessons to Excel…", 1, 1)))
+            backup = replace_book(path, self.book.get(), self.preview_lessons, self.preserve.get())
+            report_path = write_import_report(self.book.get(), path, self.preview_lessons, [], backup)
+            self.messages.put(("done", (self.book.get(), len(self.preview_lessons), path, backup, report_path, [])))
+        except Exception as exc:
+            self.messages.put(("error", str(exc)))
+
+    def _start_verify(self) -> None:
+        path = Path(self.workbook.get().strip())
+        if not path.exists():
+            messagebox.showerror(APP_NAME, "Select a valid workbook first.")
+            return
+        self._set_busy(True)
+        threading.Thread(target=self._verify_worker, args=(path,), daemon=True).start()
+
+    def _verify_worker(self, path: Path) -> None:
+        try:
+            session = make_session()
+            urls = lesson_urls(session, self.book.get())
+            live = {}
+            for index, url in enumerate(urls, 1):
+                self.messages.put(("progress", (f"Verifying lesson {index} of {len(urls)}", index, len(urls))))
+                try:
+                    lesson = parse_lesson(session, url)
+                except Exception:
+                    continue
+                if self.include_all.get() or lesson["title"].lower().startswith("through the bible"):
+                    live[lesson["code"]] = lesson
+            wb = load_workbook(path, read_only=True, data_only=False)
+            if "Master Index" not in wb.sheetnames:
+                raise ImporterError("Workbook must contain a 'Master Index' tab.")
+            ws = wb["Master Index"]
+            cols = {clean(ws.cell(1,c).value): c for c in range(1, ws.max_column+1)}
+            diffs=[]
+            for r in range(2, ws.max_row+1):
+                if clean(ws.cell(r, cols.get("Book",5)).value).lower()!=self.book.get().lower():
+                    continue
+                code=clean(ws.cell(r, cols.get("Teaching Code",7)).value)
+                if not code or code not in live:
+                    diffs.append(f"Row {r}: teaching code missing from live archive: {code}")
+                    continue
+                lesson=live[code]
+                for field,header in [("scripture","Scripture"),("title","Title"),("date","Date")]:
+                    current=clean(ws.cell(r, cols.get(header)).value)
+                    if current!=clean(lesson[field]):
+                        diffs.append(f"Row {r} {header}: workbook='{current}' | site='{lesson[field]}'")
+            self.messages.put(("verify_done", diffs))
+        except Exception as exc:
+            self.messages.put(("error", str(exc)))
 
     def _run_worker(self, selected_book: str, path: Path, include_all: bool, preserve: bool) -> None:
         def report(text: str, current: int, total: int) -> None:
@@ -613,6 +717,28 @@ class ImporterApp:
                     self._append_log(text)
                     self.progress_bar["maximum"] = max(total, 1)
                     self.progress_bar["value"] = current
+                elif event == "preview_done":
+                    lessons, warnings = payload
+                    self.preview_lessons = lessons
+                    for number, lesson in enumerate(lessons, 1):
+                        self.preview_tree.insert("", END, values=(number, lesson["code"], lesson["scripture"], lesson["title"], lesson["date"]))
+                    self.status.set(f"Preview ready: {len(lessons)} lessons; {len(warnings)} warning(s).")
+                    self._append_log(f"Preview ready for {self.book.get()}: {len(lessons)} lessons.")
+                    self._set_busy(False)
+                    if warnings:
+                        self._append_log(f"Warnings: {len(warnings)}")
+                elif event == "verify_done":
+                    diffs = payload
+                    self._set_busy(False)
+                    if diffs:
+                        self.status.set(f"Verification found {len(diffs)} difference(s).")
+                        self._append_log("Verification differences:")
+                        for line in diffs[:100]:
+                            self._append_log(line)
+                        messagebox.showwarning(APP_NAME, f"Verification found {len(diffs)} difference(s). See Activity for details.")
+                    else:
+                        self.status.set("Verification complete: no differences found.")
+                        messagebox.showinfo(APP_NAME, "Verification complete. No differences were found for the selected book.")
                 elif event == "done":
                     selected_book, count, path, backup, report_path, warnings = payload
                     self.status.set(f"Completed: {count} {selected_book} lessons imported.")
@@ -621,7 +747,7 @@ class ImporterApp:
                     self._append_log(f"Import report: {report_path}")
                     if warnings:
                         self._append_log(f"Warnings: {len(warnings)} (see report)")
-                    self.import_button.configure(state="normal")
+                    self._set_busy(False)
                     messagebox.showinfo(
                         APP_NAME,
                         f"Completed!\n\n"
@@ -634,7 +760,7 @@ class ImporterApp:
                 elif event == "error":
                     self.status.set("Import failed.")
                     self._append_log(f"ERROR: {payload}")
-                    self.import_button.configure(state="normal")
+                    self._set_busy(False)
                     messagebox.showerror(APP_NAME, str(payload))
         except queue.Empty:
             pass

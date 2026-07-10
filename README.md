@@ -1,26 +1,42 @@
-# Athey Creek Book Importer v2
+# Athey Creek Book Importer — Final Version 3
 
-Version 2 enhancements:
+This final version is designed for the book-by-book workflow.
 
-- Automatically detects an Excel workbook located beside the EXE
-- Reads exact Scripture, title, date and teaching code from each official lesson page
-- Retries temporary website failures
-- Skips duplicate teaching codes
-- Continues through individual page errors and records warnings
-- Preserves Done checkmarks and Notes
+## Features
+
+- Select any of the 66 Bible books
+- Preview every matching lesson before Excel is changed
+- Reads exact Scripture, title, date, teaching code and lesson URL from each official lesson page
+- Imports only Through the Bible lessons unless **Include all teachings** is checked
+- Verify the selected book already in the workbook against the current official pages
+- Preserves Done checkmarks and Notes by teaching code
+- Replaces only the selected book
+- Keeps Bible-book order
 - Creates a timestamped workbook backup
-- Creates a CSV import report in a `reports` folder beside the EXE
-- Shows live lesson-by-lesson progress
+- Creates a CSV import report
+- Detects duplicate teaching codes
+- Retries temporary website failures
+- Automatically suggests an `.xlsx` workbook placed beside the EXE
 
-## Build
+## Build in the existing GitHub repository
 
-Replace the existing repository files with the contents of this package. Committing the updated files triggers GitHub Actions. Download the artifact named `Athey-Creek-Windows-Importer-v2`.
+Upload and replace the visible files in this package. Then replace the workflow file at:
 
-## Use
+`.github/workflows/build-windows-exe.yml`
 
-1. Keep the workbook closed in Excel.
-2. Place it beside the EXE for automatic detection, or use Browse.
-3. Select the Bible book.
-4. Leave Include all teachings unchecked for the Through-the-Bible path.
-5. Click Import Selected Book.
-6. Review the workbook and the CSV report after completion.
+GitHub Actions will create an artifact named:
+
+`Athey-Creek-Windows-Importer-Final`
+
+## Normal use
+
+1. Close the workbook in Excel.
+2. Open `Athey_Creek_Book_Importer.exe`.
+3. Select the next Bible book.
+4. Select the workbook.
+5. Click **1. Preview Selected Book**.
+6. Review the exact Scripture, title and date in the preview table.
+7. Click **2. Import Previewed Book**.
+8. Reopen the workbook after the completion message.
+
+Use **Verify Workbook Book** whenever you want to compare an already imported book to the live official pages without changing Excel.
