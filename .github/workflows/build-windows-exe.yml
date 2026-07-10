@@ -1,0 +1,53 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "athey_creek_importer.py"
+      - "requirements.txt"
+      - "Athey_Creek_Book_Importer.spec"
+      - ".github/workflows/build-windows-exe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build standalone Windows application
+        run: pyinstaller --clean --noconfirm Athey_Creek_Book_Importer.spec
+
+      - name: Copy files into release folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item dist\Athey_Creek_Book_Importer.exe release\
+          Copy-Item Athey_Creek_Book_Importer_Template.xlsx release\
+          Copy-Item README.md release\
+
+      - name: Upload finished Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Athey-Creek-Windows-Importer
+          path: release/*
+          if-no-files-found: error
