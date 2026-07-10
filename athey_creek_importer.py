@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import queue
+import csv
+import logging
+import sys
 import re
 import shutil
 import threading
@@ -20,7 +23,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 APP_NAME = "Athey Creek Book Importer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 BASE_URL = "https://atheycreek.com"
 BOOKS_URL = f"{BASE_URL}/teachings/books"
 USER_AGENT = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) {APP_NAME}/{APP_VERSION}"
@@ -50,6 +53,48 @@ HEADERS = [
     "Done", "Archive Source", "Testament", "Bible Order", "Book", "Lesson #",
     "Teaching Code", "Scripture", "Title", "Date", "Listen", "Listen URL", "Notes"
 ]
+
+
+def application_folder() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def find_default_workbook() -> Path | None:
+    candidates = []
+    for path in application_folder().glob("*.xlsx"):
+        if path.name.startswith("~$") or "_backup_" in path.stem.lower():
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    non_templates = [p for p in candidates if "template" not in p.stem.lower()]
+    return max(non_templates or candidates, key=lambda p: p.stat().st_mtime)
+
+
+def write_import_report(book: str, workbook_path: Path, lessons: list[dict[str, str]], warnings: list[str], backup: Path) -> Path:
+    reports = application_folder() / "reports"
+    reports.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report = reports / f"{book.replace(' ', '_')}_{stamp}.csv"
+    with report.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["Book", book])
+        writer.writerow(["Workbook", str(workbook_path)])
+        writer.writerow(["Backup", str(backup)])
+        writer.writerow(["Imported Lessons", len(lessons)])
+        writer.writerow(["Warnings", len(warnings)])
+        writer.writerow([])
+        writer.writerow(["Teaching Code", "Scripture", "Title", "Date", "Listen URL"])
+        for lesson in lessons:
+            writer.writerow([lesson["code"], lesson["scripture"], lesson["title"], lesson["date"], lesson["listen_url"]])
+        if warnings:
+            writer.writerow([])
+            writer.writerow(["Warnings"] )
+            for warning in warnings:
+                writer.writerow([warning])
+    return report
 
 
 class ImporterError(RuntimeError):
@@ -407,9 +452,20 @@ def import_book(
     progress(f"Found {len(urls)} lesson pages. Reading official metadata…", 0, len(urls))
 
     lessons: list[dict[str, str]] = []
+    warnings: list[str] = []
+    seen_codes: set[str] = set()
     for index, url in enumerate(urls, 1):
         progress(f"Reading lesson {index} of {len(urls)}", index, len(urls))
-        lesson = parse_lesson(session, url)
+        try:
+            lesson = parse_lesson(session, url)
+        except Exception as exc:
+            warnings.append(f"{url}: {exc}")
+            continue
+
+        if lesson["code"] in seen_codes:
+            warnings.append(f"Duplicate teaching code skipped: {lesson['code']}")
+            continue
+        seen_codes.add(lesson["code"])
 
         if include_all or lesson["title"].lower().startswith("through the bible"):
             lessons.append(lesson)
@@ -421,18 +477,20 @@ def import_book(
 
     progress(f"Writing {len(lessons)} lessons to Excel…", len(urls), len(urls))
     backup = replace_book(workbook_path, selected_book, lessons, preserve_progress)
-    return len(lessons), backup
+    report_path = write_import_report(selected_book, workbook_path, lessons, warnings, backup)
+    return len(lessons), backup, report_path, warnings
 
 
 class ImporterApp:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.geometry("760x560")
+        self.root.geometry("800x590")
         self.root.minsize(700, 500)
 
         self.book = StringVar(value="Genesis")
-        self.workbook = StringVar()
+        default_workbook = find_default_workbook()
+        self.workbook = StringVar(value=str(default_workbook) if default_workbook else "")
         self.include_all = BooleanVar(value=False)
         self.preserve = BooleanVar(value=True)
         self.status = StringVar(value="Choose a Bible book and workbook.")
@@ -445,10 +503,10 @@ class ImporterApp:
         frame = ttk.Frame(self.root, padding=18)
         frame.pack(fill=BOTH, expand=True)
 
-        ttk.Label(frame, text="Athey Creek Book Importer", font=("Segoe UI", 18, "bold")).pack(anchor=W)
+        ttk.Label(frame, text=f"Athey Creek Book Importer v{APP_VERSION}", font=("Segoe UI", 18, "bold")).pack(anchor=W)
         ttk.Label(
             frame,
-            text="Imports exact Scripture, title and date from each official lesson page.",
+            text="Imports exact Scripture, title and date, creates a backup, and writes an import report.",
         ).pack(anchor=W, pady=(2, 18))
 
         fields = ttk.Frame(frame)
@@ -538,10 +596,10 @@ class ImporterApp:
             self.messages.put(("progress", (text, current, total)))
 
         try:
-            count, backup = import_book(
+            count, backup, report_path, warnings = import_book(
                 selected_book, path, include_all, preserve, report
             )
-            self.messages.put(("done", (selected_book, count, path, backup)))
+            self.messages.put(("done", (selected_book, count, path, backup, report_path, warnings)))
         except Exception as exc:
             self.messages.put(("error", str(exc)))
 
@@ -556,17 +614,22 @@ class ImporterApp:
                     self.progress_bar["maximum"] = max(total, 1)
                     self.progress_bar["value"] = current
                 elif event == "done":
-                    selected_book, count, path, backup = payload
+                    selected_book, count, path, backup, report_path, warnings = payload
                     self.status.set(f"Completed: {count} {selected_book} lessons imported.")
                     self._append_log(f"Completed. Workbook saved: {path}")
                     self._append_log(f"Backup created: {backup}")
+                    self._append_log(f"Import report: {report_path}")
+                    if warnings:
+                        self._append_log(f"Warnings: {len(warnings)} (see report)")
                     self.import_button.configure(state="normal")
                     messagebox.showinfo(
                         APP_NAME,
                         f"Completed!\n\n"
                         f"{count} {selected_book} lessons were imported.\n\n"
                         f"Workbook:\n{path}\n\n"
-                        f"Backup:\n{backup}",
+                        f"Backup:\n{backup}\n\n"
+                        f"Import report:\n{report_path}\n\n"
+                        f"Warnings: {len(warnings)}",
                     )
                 elif event == "error":
                     self.status.set("Import failed.")
