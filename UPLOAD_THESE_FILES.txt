@@ -1,0 +1,12 @@
+Upload the entire folder contents to the root of your GitHub repository.
+
+Required:
+- .github/workflows/build-windows-exe.yml
+- athey_creek_importer.py
+- Athey_Creek_Book_Importer.spec
+- Athey_Creek_Book_Importer_Template.xlsx
+- requirements.txt
+- README.md
+- .gitignore
+
+Do not upload only the Python file. The .github folder is what performs the Windows build.
